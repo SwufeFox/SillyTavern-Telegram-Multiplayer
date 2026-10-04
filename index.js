@@ -62,6 +62,10 @@ let isGenerating = false;
 // 消息队列：Multiplayer 下生成期间的新消息先入队，回复完成后按序处理
 // 元素: { chatId, text, username, isGroup }
 let messageQueue = [];
+const MAX_PENDING_MESSAGES = 20;
+const RESUME_QUEUE_INTERVAL_MS = 1500;
+let lastQueueProcessAt = 0;
+let queueResumeTimer = null;
 
 // 缓冲模式：收集一段时间内多名玩家的消息，合并成一条发送给 AI
 
@@ -952,21 +956,65 @@ async function handleBridgeControlCommand(data, context) {
  */
 function enqueueOrProcess(item) {
     if (isGenerating) {
-        // 静默入队：不向 Telegram 发送任何提示消息，避免打扰（队列会在当前回复完成后自动处理）
+        // Compact same-chat backlog without dropping older user content.
+        if (messageQueue.length >= MAX_PENDING_MESSAGES) {
+            compactPendingMessages();
+            const queuedForChat = messageQueue.find(queued => queued.chatId === item.chatId);
+            if (queuedForChat) {
+                queuedForChat.text = `${queuedForChat.text}\n${item.text}`;
+                queuedForChat.username = null;
+                queuedForChat.isGroup = false;
+                if (item.sticker) queuedForChat.sticker = item.sticker;
+                return;
+            }
+            console.warn(`[Telegram Bridge] 消息积压超过 ${MAX_PENDING_MESSAGES} 个会话，保留新消息等待限速处理。`);
+        }
         messageQueue.push(item);
         console.log(`[Telegram Bridge] 正在生成回复，消息已入队。队列长度: ${messageQueue.length}`);
-
         return;
     }
     processMessage(item);
 }
 
-/**
- * 处理队列中的下一条消息
- */
+function deferPendingBuffer(bufferItem) {
+    if (!bufferItem) return;
+    const parts = bufferItem.parts.map(part => typeof part === 'string'
+        ? part
+        : (part.isGroup ? applyUserPrefix(part) : part.text));
+    messageQueue.push({ chatId: bufferItem.chatId, text: parts.join('\n'), username: null, isGroup: false });
+}
+
+/** Collapse stale work after an offline interval: one prompt per chat. */
+function compactPendingMessages() {
+    const compacted = new Map();
+    for (const item of messageQueue) {
+        const previous = compacted.get(item.chatId);
+        if (!previous) {
+            compacted.set(item.chatId, { ...item });
+        } else {
+            previous.text = `${previous.text}\n${item.text}`;
+            previous.username = null;
+            previous.isGroup = false;
+            if (item.sticker) previous.sticker = item.sticker;
+        }
+    }
+    messageQueue = Array.from(compacted.values());
+}
+
+/** Process at a bounded rate so expired sleep timers cannot replay as a burst. */
 function processNextFromQueue() {
+    if (isGenerating || queueResumeTimer || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const wait = Math.max(0, RESUME_QUEUE_INTERVAL_MS - (Date.now() - lastQueueProcessAt));
+    if (wait > 0) {
+        queueResumeTimer = setTimeout(() => {
+            queueResumeTimer = null;
+            processNextFromQueue();
+        }, wait);
+        return;
+    }
     const next = messageQueue.shift();
     if (!next) return;
+    lastQueueProcessAt = Date.now();
     console.log(`[Telegram Bridge] 处理队列消息，剩余队列长度: ${messageQueue.length}`);
     processMessage(next);
 }
@@ -992,14 +1040,17 @@ function addToBuffer(item) {
     }
     // 重置窗口定时器
     if (buffer.timer) clearTimeout(buffer.timer);
-    buffer.timer = setTimeout(flushBuffer, (getSettings().bufferWindowSeconds || 30) * 1000);
+    const pendingBuffer = buffer;
+    pendingBuffer.timer = setTimeout(() => {
+        if (buffer === pendingBuffer) flushBuffer(pendingBuffer);
+    }, (getSettings().bufferWindowSeconds || 30) * 1000);
 }
 
 /**
  * 冲刷缓冲区：把收集到的多条玩家消息合并为一条发送给 AI
  */
-function flushBuffer() {
-    if (!buffer) return;
+function flushBuffer(expectedBuffer = null) {
+    if (!buffer || (expectedBuffer && buffer !== expectedBuffer)) return;
     const b = buffer;
     buffer = null;
     if (b.timer) clearTimeout(b.timer);
@@ -1019,12 +1070,15 @@ function addToMergeBuffer(item, windowSeconds) {
     }
     mergeBuffer.parts.push(item);
     if (mergeBuffer.timer) clearTimeout(mergeBuffer.timer);
-    mergeBuffer.timer = setTimeout(flushMergeBuffer, windowSeconds * 1000);
+    const pendingMergeBuffer = mergeBuffer;
+    pendingMergeBuffer.timer = setTimeout(() => {
+        if (mergeBuffer === pendingMergeBuffer) flushMergeBuffer(pendingMergeBuffer);
+    }, windowSeconds * 1000);
     console.log(`[Telegram Bridge] 消息进入合并窗口 (${mergeBuffer.parts.length} 条)，${windowSeconds} 秒后触发`);
 }
 
-function flushMergeBuffer() {
-    if (!mergeBuffer) return;
+function flushMergeBuffer(expectedBuffer = null) {
+    if (!mergeBuffer || (expectedBuffer && mergeBuffer !== expectedBuffer)) return;
     const b = mergeBuffer;
     mergeBuffer = null;
     if (b.timer) clearTimeout(b.timer);
@@ -1275,6 +1329,8 @@ async function connect() {
         updateStatus('已连接', 'green');
         resetReconnectState();
         resetHeartbeatTimeout();
+        compactPendingMessages();
+        processNextFromQueue();
     };
 
     connection.onmessage = async (event) => {
@@ -1659,6 +1715,17 @@ async function connect() {
         if (ws !== connection) return;
         clearHeartbeatTimeout();
         ws = null;
+        if (buffer) {
+            if (buffer.timer) clearTimeout(buffer.timer);
+            deferPendingBuffer(buffer);
+            buffer = null;
+        }
+        if (mergeBuffer) {
+            if (mergeBuffer.timer) clearTimeout(mergeBuffer.timer);
+            deferPendingBuffer(mergeBuffer);
+            mergeBuffer = null;
+        }
+        compactPendingMessages();
         const settings = getSettings();
         if (settings.autoConnect && !isReconnecting) {
             updateStatus('连接已断开，准备重连...', 'orange');

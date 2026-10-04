@@ -1599,9 +1599,13 @@ wss.on('connection', ws => {
                 // 3. 尝试触发一次编辑（节流保护）
                 // 使用 session.messageId 直接检查
                 if (session.messageId && !session.isEditing && !session.timer) {
-                    session.timer = setTimeout(() => {
-                        const currentSession = ongoingStreams.get(data.chatId);
-                        if (currentSession && currentSession.messageId) {
+                    const scheduledSession = session;
+                    scheduledSession.timer = setTimeout(() => {
+                        // A timer can already be queued when sleep/resume or cleanup runs.
+                        // Never let an old stream edit a newer message for the same chat.
+                        if (ongoingStreams.get(data.chatId) !== scheduledSession) return;
+                        const currentSession = scheduledSession;
+                        if (currentSession.messageId) {
                             currentSession.isEditing = true;
                             // 截断过长的文本
                             const editText = formatStreamProgress(currentSession.lastText, currentSession.progressSteps);
@@ -1830,6 +1834,8 @@ wss.on('connection', ws => {
         // 清理所有流式会话的typing定时器
         ongoingStreams.forEach((session) => {
             stopTypingInterval(session.typingInterval);
+            if (session.timer) clearTimeout(session.timer);
+            if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
         });
         if (ws.commandToExecuteOnClose) {
             const { command, chatId } = ws.commandToExecuteOnClose;
@@ -1850,6 +1856,8 @@ wss.on('connection', ws => {
         // 清理所有流式会话的typing定时器
         ongoingStreams.forEach((session) => {
             stopTypingInterval(session.typingInterval);
+            if (session.timer) clearTimeout(session.timer);
+            if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
         });
         if (sillyTavernClient) {
             sillyTavernClient.commandToExecuteOnClose = null; // 清除标记，防止意外执行
