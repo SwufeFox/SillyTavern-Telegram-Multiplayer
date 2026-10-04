@@ -171,9 +171,15 @@ async function ensureChatBinding(chatId) {
                 if (newChatId !== binding.chatName) {
                     try {
                         await context.renameChat(newChatId, binding.chatName);
+                        const renamedChats = await getPastCharacterChats(context.characterId);
+                        const renameSucceeded = Array.isArray(renamedChats)
+                            && renamedChats.some(c => c.file_name === `${binding.chatName}.jsonl`);
+                        if (!renameSucceeded) {
+                            throw new Error(`Renamed chat ${binding.chatName}.jsonl was not found`);
+                        }
                     } catch (renameError) {
-                        // renameChat 失败（ST 弹 "Chat was not renamed" 错误）：
-                        // 直接用默认聊天名作为绑定，避免每条消息都重试新建+重命名
+                        // renameChat 会捕获底层请求错误并正常返回；重读聊天列表确认重命名已生效
+                        // 失败时直接用默认聊天名作为绑定，避免每条消息都重试新建+重命名
                         console.error(`[Telegram Bridge] 重命名聊天失败，绑定改用默认名 ${newChatId}:`, renameError);
                         binding.chatName = newChatId;
                     }
@@ -1118,40 +1124,25 @@ async function processMessage(item) {
     }
 
     // 3. 设置流式传输的回调
-    let firstChunkSent = false;
+    // Do not forward generation chunks. SillyTavern exposes the authoritative
+    // is_system marker only on the completed chat message, so streaming text
+    // could reach Telegram before that message is classified.
     const streamCallback = (...args) => {
-        let cumulativeText = '';
-        if (typeof args[0] === 'string') {
-            cumulativeText = args[0];
-        } else if (args[0] && typeof args[0].text === 'string') {
-            cumulativeText = args[0].text;
-        } else if (args[0] && typeof args[0].message === 'string') {
-            cumulativeText = args[0].message;
-        }
-        if (ws && ws.readyState === WebSocket.OPEN && cumulativeText) {
-            const payload = {
-                type: 'stream_chunk',
-                chatId: item.chatId,
-                text: cumulativeText,
-            };
-            // 提及消息：仅首条 chunk 携带 mentioned，服务器跳过字符阈值立即发送初始消息
-            if (!firstChunkSent && item.mentioned) payload.mentioned = true;
-            firstChunkSent = true;
-            ws.send(JSON.stringify(payload));
+        // Keep extracting the cumulative value locally for diagnostics only.
+        const cumulativeText = typeof args[0] === 'string'
+            ? args[0]
+            : (typeof args[0]?.text === 'string' ? args[0].text
+                : (typeof args[0]?.message === 'string' ? args[0].message : ''));
+        if (cumulativeText) {
+            console.debug('[Telegram Bridge] Generation chunk held until final message classification.');
         }
     };
     eventSource.on(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
 
-    // 4. 清理函数：生成结束（成功/失败/手动停止）后执行
-    //    仅在确实发送过流式块时才发送 stream_end（让服务器停止 typing、启动兜底清理）。
-    //    非流式生成（从未有过 chunk，服务器无会话）不发送，避免服务器"找不到会话"的误告警；
-    //    该情形下最终消息由 final_message_update 正常送达，无需 stream_end。
-    //    出错时的错误提示由 error_message 单独发送，与 stream_end 无冲突。
+    // 4. 清理函数：生成结束（成功/失败/手动停止）后执行。
+    // 最终文本在 GENERATION_ENDED/STOPPED 后按 is_system 判定再发送；不发送流式结束消息。
     const cleanup = () => {
         eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
-        if (ws && ws.readyState === WebSocket.OPEN && firstChunkSent) {
-            ws.send(JSON.stringify({ type: 'stream_end', chatId: item.chatId }));
-        }
     };
 
     // 5. 监听生成结束事件（once，避免干扰后续消息）
@@ -1257,14 +1248,17 @@ async function connect() {
 
     ws = new WebSocket(url);
 
-    ws.onopen = () => {
+    const connection = ws;
+    connection.onopen = () => {
+        if (ws !== connection) return;
         console.log('[Telegram Bridge] 连接成功！');
         updateStatus('已连接', 'green');
         resetReconnectState();
         resetHeartbeatTimeout();
     };
 
-    ws.onmessage = async (event) => {
+    connection.onmessage = async (event) => {
+        if (ws !== connection) return;
         let data;
         try {
             data = JSON.parse(event.data);
@@ -1634,8 +1628,9 @@ async function connect() {
         }
     };
 
-    ws.onclose = () => {
+    connection.onclose = () => {
         console.log('[Telegram Bridge] 连接已关闭。');
+        if (ws !== connection) return;
         clearHeartbeatTimeout();
         ws = null;
         const settings = getSettings();
@@ -1647,8 +1642,9 @@ async function connect() {
         }
     };
 
-    ws.onerror = (error) => {
+    connection.onerror = (error) => {
         console.error('[Telegram Bridge] WebSocket 错误：', error);
+        if (ws !== connection) return;
         clearHeartbeatTimeout();
         updateStatus('连接错误', 'red');
     };
@@ -1724,7 +1720,10 @@ function handleLocalGeneration(lastMessageIdInChatArray) {
     setTimeout(() => {
         const context = SillyTavern.getContext();
         const lastMessage = context.chat[lastMessageIndex];
-        if (!lastMessage || lastMessage.is_user || lastMessage.is_system) return;
+        if (!lastMessage || lastMessage.is_user || lastMessage.is_system) {
+            if (lastMessage?.is_system) console.debug('[Telegram Bridge] Suppressed SillyTavern system message from Telegram sync:', lastMessage.mes);
+            return;
+        }
         if (typeof lastMessage.mes !== 'string' || !lastMessage.mes.trim()) return;
 
         console.log('[Telegram Bridge] 酒馆本地生成，同步到 Telegram:', lastMessage.mes.slice(0, 50));
@@ -1787,6 +1786,8 @@ function handleFinalMessage(lastMessageIdInChatArray) {
                     text: renderedText,
                 }));
             }
+        } else if (lastMessage?.is_system) {
+            console.debug('[Telegram Bridge] Suppressed SillyTavern system message from Telegram delivery:', lastMessage.mes);
         }
 
         // 重置当前会话标识（不管成功与否）

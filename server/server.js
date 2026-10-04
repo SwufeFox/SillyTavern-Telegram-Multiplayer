@@ -937,6 +937,15 @@ const TYPING_INTERVAL = 4000; // 每4秒发送一次typing状态
 const MIN_CHARS_BEFORE_DISPLAY = config.streaming?.minCharsBeforeDisplay || 50; // 最小显示字符数
 const STREAM_SESSION_TTL_MS = 60000; // 流式会话兜底清理TTL：stream_end 后若最终更新未到达，超时删除残留会话
 
+function formatStreamProgress(text, steps) {
+    const progress = Math.max(1, Math.min(12, steps || 1));
+    const suffix = `\n\n${'#'.repeat(progress)}(${progress}/12)`;
+    const body = text.length + suffix.length > 4096
+        ? `${text.substring(0, 4096 - suffix.length - 3)}...`
+        : text;
+    return `${body}${suffix}`;
+}
+
 // --- 心跳管理函数 ---
 /**
  * 启动心跳检测，每30秒发送心跳消息到客户端
@@ -1471,9 +1480,18 @@ wss.on('connection', ws => {
     startHeartbeat(ws);
 
     ws.on('message', async (message) => { // 将整个回调设为async
+        if (sillyTavernClient !== ws) return;
         let data; // 在 try 块外部声明 data
         try {
             data = JSON.parse(message);
+
+            // Protocol-level fail-closed guard for classified SillyTavern system output.
+            // The extension normally suppresses this before forwarding it; keep every
+            // Telegram send branch protected if a marked payload reaches the bridge.
+            if (data.is_system === true) {
+                logWithTimestamp('log', `已抑制系统/脏消息，type=${data.type || 'unknown'}, chatId=${data.chatId || 'unknown'}, text=${String(data.text || '')}`);
+                return;
+            }
 
             // --- 处理心跳响应 ---
             if (data.type === 'heartbeat_ack') {
@@ -1518,6 +1536,9 @@ wss.on('connection', ws => {
                         sendingInitial: false, // 标记是否正在发送初始消息
                         typingInterval: typingInterval,
                         charCount: data.text ? data.text.length : 0,
+                        editPromise: null,
+                        progressSteps: data.text ? 1 : 0,
+                        lastProgressText: data.text || '',
                     };
                     ongoingStreams.set(data.chatId, session);
 
@@ -1527,7 +1548,7 @@ wss.on('connection', ws => {
                         session.sendingInitial = true;
                         logWithTimestamp('log', `字符数 ${session.charCount} 超过阈值，发送初始消息...`);
                         // 截断过长的文本，避免超过 Telegram 限制
-                        const displayText = data.text.length > 4000 ? data.text.substring(0, 4000) + '...' : data.text + ' ...';
+                        const displayText = formatStreamProgress(data.text, session.progressSteps);
                         bot.sendMessage(data.chatId, displayText)
                             .then(sentMessage => {
                                 logWithTimestamp('log', `初始消息发送成功，messageId: ${sentMessage.message_id}`);
@@ -1545,6 +1566,10 @@ wss.on('connection', ws => {
                     // 2. 如果会话存在，更新最新文本和字符计数
                     session.lastText = data.text;
                     session.charCount = data.text ? data.text.length : 0;
+                    if (data.text) {
+                        session.progressSteps = Math.min(12, (session.progressSteps || 0) + 1);
+                        session.lastProgressText = data.text;
+                    }
 
                     // 检查是否达到字符阈值且尚未发送初始消息（提及消息跳过阈值）
                     if (!session.messageId && (session.charCount >= MIN_CHARS_BEFORE_DISPLAY || data.mentioned) && !session.sendingInitial) {
@@ -1553,7 +1578,7 @@ wss.on('connection', ws => {
                         logWithTimestamp('log', `会话已存在，字符数 ${session.charCount} 超过阈值，发送初始消息...`);
 
                         // 截断过长的文本
-                        const displayText = data.text.length > 4000 ? data.text.substring(0, 4000) + '...' : data.text + ' ...';
+                        const displayText = formatStreamProgress(data.text, session.progressSteps);
                         bot.sendMessage(data.chatId, displayText)
                             .then(sentMessage => {
                                 logWithTimestamp('log', `初始消息发送成功，messageId: ${sentMessage.message_id}`);
@@ -1579,10 +1604,8 @@ wss.on('connection', ws => {
                         if (currentSession && currentSession.messageId) {
                             currentSession.isEditing = true;
                             // 截断过长的文本
-                            const editText = currentSession.lastText.length > 4000
-                                ? currentSession.lastText.substring(0, 4000) + '...'
-                                : currentSession.lastText + ' ...';
-                            bot.editMessageText(editText, {
+                            const editText = formatStreamProgress(currentSession.lastText, currentSession.progressSteps);
+                            currentSession.editPromise = bot.editMessageText(editText, {
                                 chat_id: data.chatId,
                                 message_id: currentSession.messageId,
                             }).catch(err => {
@@ -1590,7 +1613,10 @@ wss.on('connection', ws => {
                                     logWithTimestamp('error', '编辑Telegram消息失败:', err.message);
                             }).finally(() => {
                                 const latest = ongoingStreams.get(data.chatId);
-                                if (latest) latest.isEditing = false;
+                                if (latest === currentSession) {
+                                    latest.isEditing = false;
+                                    latest.editPromise = null;
+                                }
                             });
                         }
                         // 会话可能在编辑期间被 final_message_update/cleanup_session 删除
@@ -1648,15 +1674,18 @@ wss.on('connection', ws => {
                     // 停止"输入中"状态 (确保清理)
                     stopTypingInterval(session.typingInterval);
 
-                    // 竞态修复：初始消息可能还在发送中（messageId 尚未赋值）。
-                    // 此时若直接发最终消息，群里会出现"初始消息 + 完整消息"两条重复。
-                    // 等待初始消息完成拿到 messageId 后原地编辑，最多等 3 秒。
+                    // 竞态修复：初始消息可能还在发送中，等待其完成后再原地编辑最终消息。
                     if (!session.messageId && session.sendingInitial && session.messagePromise) {
                         logWithTimestamp('log', `初始消息发送中，等待其完成后再编辑最终消息...`);
-                        await Promise.race([
-                            session.messagePromise.then(() => { }).catch(() => { }),
-                            new Promise(resolve => setTimeout(resolve, 3000)),
-                        ]);
+                        await session.messagePromise;
+                    }
+
+                    if (session.timer) {
+                        clearTimeout(session.timer);
+                        session.timer = null;
+                    }
+                    if (session.editPromise) {
+                        await session.editPromise;
                     }
 
                     // 直接使用 session.messageId
@@ -1795,6 +1824,7 @@ wss.on('connection', ws => {
 
     ws.on('close', () => {
         logWithTimestamp('log', 'SillyTavern扩展已断开连接。');
+        if (sillyTavernClient !== ws) return;
         // 停止心跳检测
         stopHeartbeat();
         // 清理所有流式会话的typing定时器
@@ -1814,6 +1844,7 @@ wss.on('connection', ws => {
 
     ws.on('error', (error) => {
         logWithTimestamp('error', 'WebSocket发生错误:', error);
+        if (sillyTavernClient !== ws) return;
         // 停止心跳检测
         stopHeartbeat();
         // 清理所有流式会话的typing定时器
