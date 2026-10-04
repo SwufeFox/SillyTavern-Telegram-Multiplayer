@@ -807,7 +807,7 @@ if (!telegramDisabled) {
 }
 
 // 初始化WebSocket服务器
-const wss = new WebSocket.Server({ port: wssPort });
+const wss = new WebSocket.Server({ port: wssPort, maxPayload: 8 * 1024 * 1024 });
 logWithTimestamp('log', `WebSocket服务器正在监听端口 ${wssPort}...`);
 
 let sillyTavernClient = null; // 用于存储连接的SillyTavern扩展客户端
@@ -2067,7 +2067,7 @@ function buildReplyContext(replyTo) {
     const sender = replyTo.from ? (replyTo.from.username || replyTo.from.first_name || '未知用户') : '未知用户';
     let quoted = replyTo.text || replyTo.caption || '';
     if (!quoted) {
-        if (replyTo.sticker) quoted = `贴纸${replyTo.sticker.emoji ? ' ' + replyTo.sticker.emoji : ''}`;
+        if (replyTo.sticker) quoted = `贴纸${replyTo.sticker.emoji ? ' ' + replyTo.sticker.emoji : ''} (${replyTo.sticker.is_video ? '视频' : replyTo.sticker.is_animated ? '动画' : '静态'})`;
         else if (replyTo.photo) quoted = '图片';
         else if (replyTo.animation) quoted = 'GIF';
         else if (replyTo.voice) quoted = '语音';
@@ -2076,6 +2076,41 @@ function buildReplyContext(replyTo) {
     }
     if (!quoted) return '';
     return `[回复 @${sender}: "${String(quoted).slice(0, 200)}"] `;
+}
+
+// Telegram getFile supports bot-accessible files in private and group chats. Keep
+// the original identifiers/type in the payload; data is a best-effort image preview.
+async function getStickerMedia(sticker) {
+    if (!sticker || !sticker.file_id) return null;
+    const media = {
+        fileId: sticker.file_id,
+        fileUniqueId: sticker.file_unique_id || null,
+        isAnimated: !!sticker.is_animated,
+        isVideo: !!sticker.is_video,
+        emoji: sticker.emoji || null,
+        setName: sticker.set_name || null,
+        width: sticker.width || null,
+        height: sticker.height || null,
+        mimeType: sticker.is_video ? 'video/webm' : (sticker.is_animated ? 'application/x-tgsticker' : 'image/webp'),
+        imageDataUrl: null,
+    };
+    try {
+        const file = await bot.getFile(sticker.file_id);
+        const fileUrl = await bot.getFileLink(sticker.file_id);
+        const response = await fetch(fileUrl);
+        if (!response.ok) throw new Error(`Telegram file download HTTP ${response.status}`);
+        const bytes = Buffer.from(await response.arrayBuffer());
+        // Sticker previews travel as transient transport data. Keep the image
+        // below the bridge's JSON WebSocket limit; the browser uploads it to ST.
+        if (!media.isAnimated && !media.isVideo && bytes.length <= 5 * 1024 * 1024) {
+            media.imageDataUrl = `data:image/webp;base64,${bytes.toString('base64')}`;
+        }
+        media.filePath = file.file_path || null;
+        media.fileSize = file.file_size || bytes.length;
+    } catch (error) {
+        logWithTimestamp('warn', `下载 Telegram sticker ${sticker.file_id} 失败:`, error.message);
+    }
+    return media;
 }
 
 // 监听Telegram消息
@@ -2169,9 +2204,12 @@ bot.on('message', async (msg) => {
 
     }
 
-    // 非文本消息（贴纸/图片/GIF/语音/视频/文件）→ 占位描述，让 AI 知道用户发了什么
+    // Resolve sticker bytes before normalization so the media survives queueing and merging.
+    const stickerMedia = msg.sticker ? await getStickerMedia(msg.sticker) : null;
+
+    // 非文本消息（贴纸/图片/GIF/语音/视频/文件）→ 描述 + 保留真实媒体
     if (!text) {
-        if (msg.sticker) text = `[贴纸${msg.sticker.emoji ? ' ' + msg.sticker.emoji : ''}]`;
+        if (msg.sticker) text = `[贴纸${msg.sticker.emoji ? ' ' + msg.sticker.emoji : ''}${msg.sticker.is_video ? '，视频贴纸' : msg.sticker.is_animated ? '，动画贴纸' : ''}]`;
         else if (msg.photo) text = '[图片]';
         else if (msg.animation) text = '[GIF]';
         else if (msg.voice) text = '[语音]';
@@ -2258,7 +2296,7 @@ bot.on('message', async (msg) => {
             isGroup,
 
             mentioned,
-
+            sticker: stickerMedia,
         });
 
         sillyTavernClient.send(payload);

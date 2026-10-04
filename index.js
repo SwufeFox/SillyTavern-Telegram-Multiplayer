@@ -1106,6 +1106,26 @@ async function processMessage(item) {
     } else if (item.username && item.username !== 'null' && item.username !== 'undefined') {
         messageAuthorName = item.username;
     }
+    // Convert Telegram's static sticker preview into SillyTavern's normal file
+    // attachment input. sendMessageAsUser() then uploads it through ST's own
+    // /api/images/upload flow and stores extra.media on the chat message.
+    if (item.sticker?.imageDataUrl) {
+        try {
+            const input = document.getElementById('file_form_input');
+            if (input instanceof HTMLInputElement) {
+                const response = await fetch(item.sticker.imageDataUrl);
+                const blob = await response.blob();
+                const file = new File([blob], `telegram-sticker-${item.sticker.fileUniqueId || item.sticker.fileId || Date.now()}.webp`, { type: blob.type || 'image/webp' });
+                const transfer = new DataTransfer();
+                for (const pending of input.files || []) transfer.items.add(pending);
+                transfer.items.add(file);
+                input.files = transfer.files;
+            }
+        } catch (error) {
+            console.error('[Telegram Bridge] 无法准备贴纸图片附件:', error);
+        }
+    }
+
     try {
         await sendMessageAsUser(messageText, null, null, false, messageAuthorName);
     } catch (err) {
@@ -1280,7 +1300,13 @@ async function connect() {
                     firstName: data.firstName || null,
                     isGroup: data.isGroup === true,
                     mentioned: data.mentioned === true,
+                    sticker: data.sticker || null,
                 };
+                if (item.sticker) {
+                    const kind = item.sticker.isVideo ? '视频贴纸' : item.sticker.isAnimated ? '动画贴纸' : '静态贴纸';
+                    const details = [`${kind}`, item.sticker.emoji, item.sticker.setName ? `贴纸包 ${item.sticker.setName}` : null, `file_id ${item.sticker.fileId}`].filter(Boolean).join('，');
+                    item.text = `${item.text}\n[${details}]`;
+                }
 
                 const settings = getSettings();
 
